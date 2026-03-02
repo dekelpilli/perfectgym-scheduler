@@ -1,0 +1,15 @@
+{
+  "credentials": {
+    "email": "me@email.com",
+    "password": "mysecret123"
+  },
+  "url": "https://myspecificarea.perfectgym.com.au",
+  "classes": [
+    {
+      "name": "Body Pump (substring match & case insensitive)",
+      "trainer": "Firstname Lastname (optional, substring match & case insensitive)",
+      "start":"2026-02-23T06:00:00",
+      "club": "Glen eira"
+    }
+  ]
+}
