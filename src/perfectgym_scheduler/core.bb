@@ -74,18 +74,19 @@
                            day-classes)]
     (case (count matching-classes)
       1 (let [[{:keys [Id Status StatusReason]
-                :as   matched}] matching-classes]
-          (cond
-            (= "FullBooked" Status) (throw (ex-info "Class is already fully booked"
-                                                    {:class         class
-                                                     :matched-class matched}))
-            (and (= "Unavailable" Status)
-                 (not= StatusReason "Too soon to book") (throw (ex-info "Class is unavailable."
-                                                                        {:class         class
-                                                                         :matched-class matched})))
-            (-> (assoc-in class [:class-details :id] Id)
-                (assoc-in [:class-details :status] Status)
-                (assoc-in [:class-details :status-reason] StatusReason))))
+                :as   matched}] matching-classes
+              class-action (case Status
+                             "FullBooked" (throw (ex-info "Class is already fully booked"
+                                                          {:class         class
+                                                           :matched-class matched}))
+                             "Unavailable" (if (= StatusReason "Too soon to book")
+                                             ::schedule
+                                             (throw (ex-info "Class is unavailable."
+                                                             {:class         class
+                                                              :matched-class matched})))
+                             ::book)]
+          (-> (assoc-in class [:class-details :id] Id)
+              (assoc-in [:class-details :action] class-action)))
       0 (throw (ex-info "Could not find class." {:class       class
                                                  :day-classes day-classes}))
       (throw (ex-info "Insufficient information to match class." {:class       class
@@ -142,12 +143,11 @@
                                                  :result result}))
       {:scheduled task-name})))
 
-(defn schedule-or-book-class! [config auth-headers {{:keys [status]} :class-details
+(defn schedule-or-book-class! [config auth-headers {{:keys [action]} :class-details
                                                     :as              class}]
-  (case status
-    ("Bookable" "Awaitable") (book-class! config auth-headers class)
-    "Unavailable" (schedule-class! config auth-headers class)
-    (throw (ex-info "Unknown class status" {:class class}))))
+  (case action
+    ::book (book-class! config auth-headers class)
+    ::schedule (schedule-class! config auth-headers class)))
 
 (defn schedule-classes! [config]
   (let [{{auth "jwt-token"} :headers
@@ -188,11 +188,11 @@
                                     :data       (ex-data e)
                                     :stacktrace (with-out-str (stacktrace/print-stack-trace e))})
               write-report!))))
+    (println (str "Done. Report is available at runs/" run-id "/report.json"))
     (catch Exception e
       (println "Error while setting up program (e.g. while reading config) - "
                (ex-message e)
-               (with-out-str (stacktrace/print-stack-trace e)))))
-  (println (str "Done. Report is available at runs/" run-id "/report.json")))
+               (with-out-str (stacktrace/print-stack-trace e))))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (-> (random-uuid) str execute-run!)
@@ -202,7 +202,7 @@
   (fetch-clubs (read-config))
   (login! (read-config))
   (active-club-days (read-config))
-  (schedule-classes!)
+  (schedule-classes! (read-config))
   (-> (read-config)
       ;(update-in [:credentials :password] str "abc")
       (login!)
