@@ -1,12 +1,16 @@
 (ns perfectgym-scheduler.core
   (:require
+    [babashka.cli :as cli]
+    [babashka.fs :as fs]
     [babashka.http-client :as http]
+    [babashka.http-client.interceptors :as interceptors]
     [cheshire.core :as json]
     [clojure.java.io :as io]
     [clojure.java.shell :as shell]
     [clojure.stacktrace :as stacktrace]
     [clojure.string :as str])
   (:import
+    (java.io File)
     (java.time LocalDate LocalDateTime)
     (java.time.format DateTimeFormatter)))
 
@@ -16,7 +20,7 @@
     (http/request {:method  :post
                    :uri     url
                    :headers {"content-type" "application/json"}
-                   :body    (json/generate-string {:RememberMe true
+                   :body    (json/generate-string {:RememberMe false
                                                    :Password   password
                                                    :Login      login})})))
 
@@ -42,9 +46,8 @@
 
 (def day-club-classes (memoize fetch-day-club-classes))
 
-(defn read-config []
-  (-> (io/resource "config.json")
-      io/reader
+(defn read-json-file [config-file]
+  (-> (io/reader config-file)
       (json/parse-stream true)))
 
 (defn add-class-details [clubs {:keys [classes]}]
@@ -92,62 +95,55 @@
       (throw (ex-info "Insufficient information to match class." {:class       class
                                                                   :day-classes day-classes})))))
 
-(defn- book-class! [{:keys [url]} auth-headers {{:keys [id club-id]} :class-details}]
+(defn- book-class! [{:keys [url]} auth-headers {:keys [id club-id]} & http-config]
   (let [url (str url "/clientportal2/Classes/ClassCalendar/BookClass")
-        {:keys [body]} (http/request {:method  :post
-                                      :uri     url
-                                      :headers (assoc auth-headers
-                                                 "content-type" "application/json")
-                                      :body    (json/generate-string {:clubId  (str club-id)
-                                                                      :classId id})})]
+        {:keys [body]} (http/request (assoc http-config
+                                       :method :post
+                                       :uri url
+                                       :headers (assoc auth-headers
+                                                  "content-type" "application/json")
+                                       :body (json/generate-string {:clubId  (str club-id)
+                                                                    :classId id})))]
     {:booked (json/parse-string body true)}))
 
-(defn- schedule-class! [{:keys [run-id url]}
-                        auth-headers
-                        {:keys                [name trainer start]
+(defn- schedule-class! [{:keys [run-id url credentials]}
+                        {:keys                [index start]
                          {:keys [id club-id]} :class-details
                          :as                  class}]
   ;currently only intended for use with Windows
   ;https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks-create
-  (let [req-name-prefix (str (str/replace name #"[^a-zA-Z0-9]" "_")
-                             "_" start
-                             (when trainer (str/replace trainer #"[^a-zA-Z0-9]" "_")))
-        curl-request (as-> ["curl.exe"
-                            "--request" "POST"
-                            (str url "/clientportal2/Classes/ClassCalendar/BookClass")
-                            "--data-raw"
-                            (json/generate-string {:clubId  (str club-id)
-                                                   :classId id})] request-bits
-                           (into request-bits
-                                 (mapcat (fn [[k v]] ["-H" (str k ": " v)]))
-                                 (assoc auth-headers
-                                   "content-type" "application/json"))
-                           (str/join " " request-bits))
-        start-local-datetime (LocalDateTime/parse start)
-        task-name (str req-name-prefix "_" run-id)
-        task-name (cond-> task-name
-                          (> (count task-name) 238) (subs 0 238))
+  (let [task-name (str "perfectgym-" run-id "-" index)
+        config-file-path (-> (str "runs/" run-id "/" index ".json")
+                             io/file
+                             fs/absolutize
+                             str)
+        _ (->> (json/generate-string {:booking-details {:club-id  club-id
+                                                        :class-id id}
+                                      :url             url
+                                      :credentials     credentials})
+               (spit config-file-path))
+        schedule-datetime (-> (LocalDateTime/parse start)
+                              (.minusHours 46)
+                              (.minusMinutes 1))
         {:keys [exit]
          :as   result} (shell/sh "schtasks" "/create"
                                  "/sc" "ONCE"
-                                 "/tr" curl-request
-                                 "/st" (-> (.toLocalTime start-local-datetime)
-                                           (.plusMinutes 1) ;tolerate clock differences
-                                           (.format (DateTimeFormatter/ofPattern "HH:mm")))
-                                 "/sd" (-> (.toLocalDate start-local-datetime)
-                                           (.minusDays 2)
-                                           (.format (DateTimeFormatter/ofPattern "MM/dd/yyyy")))
+                                 "/tr" (as-> (str/join " " ["bb" *file* "--book" config-file-path]) command
+                                             (str \" command \"))
+                                 "/st" (.format schedule-datetime (DateTimeFormatter/ofPattern "HH:mm"))
+                                 "/sd" (.format schedule-datetime (DateTimeFormatter/ofPattern "dd/MM/yyyy")) ;TODO add config override?
                                  "/tn" task-name)]
     (if-not (zero? exit)
       (throw (ex-info "Failed to schedule task" {:class  class
                                                  :result result}))
       {:scheduled task-name})))
 
-(defn schedule-or-book-class! [config auth-headers {{:keys [action]} :class-details
-                                                    :as              class}]
+(defn schedule-or-book-class! [config auth-headers {{:keys [action]
+                                                     :as   class-details} :class-details
+                                                    :as                   class}]
   (case action
-    ::book (book-class! config auth-headers class)
-    ::schedule (schedule-class! config auth-headers class)))
+    ::book (book-class! config auth-headers class-details)
+    ::schedule (schedule-class! config class)))
 
 (defn schedule-classes! [config]
   (let [{{auth "jwt-token"} :headers
@@ -157,24 +153,27 @@
         auth-headers {"authorization" (str "Bearer " auth)}
         clubs (fetch-clubs config)
         classes (add-class-details clubs config)
-        matched-classes (mapv (fn [{:keys [class-details]
-                                    :as   class}]
-                                (->> (day-club-classes config class-details)
-                                     (match-class class)))
-                              classes)]
+        matched-classes (map-indexed (fn [idx {:keys [class-details]
+                                               :as   class}]
+                                       (-> (assoc class :index idx)
+                                           (match-class (day-club-classes config class-details))))
+                                     classes)]
     (mapv
       (partial schedule-or-book-class! config auth-headers)
       matched-classes)))
 
 (defn- write-report! [{:keys [run-id]
                        :as   config}]
-  (-> (dissoc config :credentials)
-      (json/generate-string {:pretty true})
-      (->> (spit (io/file (str "runs/" run-id "/report.json"))))))
+  (let [report-content (-> (dissoc config :credentials)
+                           (json/generate-string {:pretty true}))]
+    (-> (str "runs/" run-id "/report.json")
+        io/file
+        fs/absolutize
+        (spit report-content))))
 
-(defn execute-run! [run-id]
+(defn execute-scheduling! [file run-id]
   (try
-    (let [config (assoc (read-config) :run-id run-id)]
+    (let [config (assoc (read-json-file file) :run-id run-id)]
       (try
         (println "RUN ID:" run-id)
         (-> (str "runs/" run-id)
@@ -194,16 +193,56 @@
                (ex-message e)
                (with-out-str (stacktrace/print-stack-trace e))))))
 
-(when (= *file* (System/getProperty "babashka.file"))
-  (-> (random-uuid) str execute-run!)
+(defn execute-booking! [file]
+  (let [{:keys [booking-details]
+         :as   config} (read-json-file file)
+        {{auth "jwt-token"} :headers
+         :as                resp} (login! config)
+        _ (when (str/blank? auth)
+            (throw (ex-info "Bad login response" resp)))
+        auth-headers {"authorization" (str "Bearer " auth)}]
+    (loop []
+      (try
+        (let [{:keys [status body]} (book-class!
+                                      config auth-headers booking-details
+                                      :interceptors
+                                      (filterv (comp not #{::interceptors/throw-on-exceptional-status-code} :name)
+                                               interceptors/default-interceptors))]
+          (cond status
+                (interceptors/unexceptional-statuses status) (println "Class booked successfully.")
+                (= status 409) (do (Thread/sleep 10000) (recur)) ;TODO check what response is actually given for trying to book too early. Make sure it's different from trying to book a full class.
+                :else (println "Failed to book class." status body)))
+        (catch Exception e
+          (println "Error while attempting to book class"
+                   (ex-message e)
+                   (with-out-str (stacktrace/print-stack-trace e))))))))
+
+(def cli-spec
+  {:spec {:schedule {:coerce   fs/file
+                     :desc     "Path to the config file for scheduling a future bookings."
+                     :validate fs/exists?}
+          :book     {:coerce   fs/file
+                     :desc     "Path to the config file for booking classes."
+                     :validate fs/exists?}}})
+
+(defn -main [args]
+  (let [{:keys [help schedule book]} (cli/parse-opts args cli-spec)]
+    (cond
+      help (println (cli/format-opts cli-spec))
+      schedule (->> (random-uuid) str (execute-scheduling! schedule))
+      book (execute-booking! book)))
   (Thread/sleep 5000))
 
+(when (= *file* (System/getProperty "babashka.file"))
+  (-main *command-line-args*))
+
 (comment
-  (fetch-clubs (read-config))
-  (login! (read-config))
-  (active-club-days (read-config))
-  (schedule-classes! (read-config))
-  (-> (read-config)
+  (read-json-file (fs/file "resources/config.json"))
+  (fetch-clubs (read-json-file (fs/file "resources/config.json")))
+  (login! (read-json-file (fs/file "resources/config.json")))
+  (active-club-days (read-json-file (fs/file "resources/config.json")))
+  (schedule-classes! (read-json-file (fs/file "resources/config.json")))
+  (-> (read-json-file (fs/file "resources/config.json"))
       ;(update-in [:credentials :password] str "abc")
       (login!)
       json/generate-string))
