@@ -169,6 +169,7 @@
     (-> (str "runs/" run-id "/report.json")
         io/file
         fs/absolutize
+        (doto fs/create-file)
         (spit report-content))))
 
 (defn execute-scheduling! [file run-id]
