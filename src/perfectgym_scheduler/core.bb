@@ -169,7 +169,7 @@
     (-> (str "runs/" run-id "/report.json")
         io/file
         fs/absolutize
-        (doto fs/create-file)
+        str
         (spit report-content))))
 
 (defn execute-scheduling! [file run-id]
@@ -185,7 +185,9 @@
         (catch Exception e
           (-> (assoc config :error {:type       (str (class e))
                                     :message    (ex-message e)
-                                    :data       (ex-data e)
+                                    :data       (-> (ex-data e)
+                                                    (dissoc :uri)
+                                                    (update :request dissoc :uri))
                                     :stacktrace (with-out-str (stacktrace/print-stack-trace e))})
               write-report!))))
     (println (str "Done. Report is available at runs/" run-id "/report.json"))
