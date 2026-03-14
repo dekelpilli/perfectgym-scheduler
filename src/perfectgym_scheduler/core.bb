@@ -208,10 +208,10 @@
                                                    :interceptors
                                                    (filterv (comp not #{::interceptors/throw-on-exceptional-status-code} :name)
                                                             interceptors/default-interceptors))]
-                       (cond status
-                             (interceptors/unexceptional-statuses status) (println "Class booked successfully.")
-                             (= status 409) (do (Thread/sleep 10000) true) ;TODO check what response is actually given for trying to book too early. Make sure it's different from trying to book a full class.
-                             :else (println "Failed to book class." status body)))
+                       (cond
+                         (interceptors/unexceptional-statuses status) (println "Class booked successfully.")
+                         (= status 409) (do (Thread/sleep 10000) true) ;TODO check what response is actually given for trying to book too early. Make sure it's different from trying to book a full class.
+                         :else (println "Failed to book class." status body)))
                      (catch Exception e
                        (println "Error while attempting to book class"
                                 (ex-message e)
