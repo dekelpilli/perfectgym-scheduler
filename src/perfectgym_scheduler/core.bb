@@ -3,7 +3,6 @@
     [babashka.cli :as cli]
     [babashka.fs :as fs]
     [babashka.http-client :as http]
-    [babashka.http-client.interceptors :as interceptors]
     [cheshire.core :as json]
     [clojure.java.io :as io]
     [clojure.java.shell :as shell]
@@ -84,27 +83,30 @@
                                                            :matched-class matched}))
                              "Unavailable" (if (= StatusReason "Too soon to book")
                                              ::schedule
-                                             (throw (ex-info "Class is unavailable."
+                                             (throw (ex-info "Class is unavailable"
                                                              {:class         class
                                                               :matched-class matched})))
                              ::book)]
           (-> (assoc-in class [:class-details :id] Id)
               (assoc-in [:class-details :action] class-action)))
-      0 (throw (ex-info "Could not find class." {:class       class
+      0 (throw (ex-info "Could not find class" {:class       class
                                                  :day-classes day-classes}))
-      (throw (ex-info "Insufficient information to match class." {:class       class
+      (throw (ex-info "Insufficient information to match class" {:class       class
                                                                   :day-classes day-classes})))))
 
-(defn- book-class! [{:keys [url]} auth-headers {:keys [id club-id]} & http-config]
-  (let [url (str url "/clientportal2/Classes/ClassCalendar/BookClass")
-        {:keys [body]} (http/request (assoc http-config
-                                       :method :post
-                                       :uri url
-                                       :headers (assoc auth-headers
-                                                  "content-type" "application/json")
-                                       :body (json/generate-string {:clubId  (str club-id)
-                                                                    :classId id})))]
-    {:booked (json/parse-string body true)}))
+(defn- do-book-class! [{:keys [url]} auth-headers class-id club-id]
+  (let [url (str url "/clientportal2/Classes/ClassCalendar/BookClass")]
+    (http/request {:method  :post
+                   :uri     url
+                   :headers (assoc auth-headers
+                              "content-type" "application/json")
+                   :body    (json/generate-string {:clubId  (str club-id)
+                                                   :classId class-id})})))
+
+(defn- book-class! [config auth-headers {:keys [id club-id]}]
+  {:booked (-> (do-book-class! config auth-headers id club-id)
+               :body
+               (json/parse-string true))})
 
 (defn- schedule-class! [{:keys [run-id url credentials]}
                         {:keys                [index start]
@@ -188,46 +190,63 @@
                                     :data       (-> (ex-data e)
                                                     (dissoc :uri)
                                                     (update :request dissoc :uri))
-                                    :stacktrace (with-out-str (stacktrace/print-stack-trace e))})
+                                    :stacktrace (with-out-str (stacktrace/print-cause-trace e))})
               write-report!))))
     (println (str "Done. Report is available at runs/" run-id "/report.json"))
     (catch Exception e
       (println "Error while setting up program (e.g. while reading config) - "
                (ex-message e)
-               (with-out-str (stacktrace/print-stack-trace e))))))
+               (with-out-str (stacktrace/print-cause-trace e))))))
+
+(defn- fetch-class-status [{:keys [url]} auth-headers class-id]
+  (let [url (str url "/clientportal2/Classes/ClassCalendar/Details")
+        {:keys               [Status]
+         {:keys [Indicator]} :BookingIndicator} (-> (http/request {:method       :get
+                                                                   :headers      auth-headers
+                                                                   :uri          url
+                                                                   :query-params {"classId" class-id}})
+                                                    :body
+                                                    (json/parse-string true))]
+    (case Status
+      ("Awaitable" "Bookable") ::ready
+      "Unavailable" (if (= Indicator 5) ;is this ever not 5?
+                      ::too-soon
+                      ::unavailable)
+      ("Awaiting" "Booked") ::actioned
+      "FullBooked" ::full)))
 
 (defn execute-booking! [file]
-  (let [{:keys [booking-details]
-         :as   config} (read-json-file file)
+  (let [{{:keys [class-id club-id]} :booking-details
+         :as                        config} (read-json-file file)
         {{auth "jwt-token"} :headers
          :as                resp} (login! config)
         _ (when (str/blank? auth)
             (throw (ex-info "Bad login response" resp)))
         auth-headers {"authorization" (str "Bearer " auth)}]
-    (loop []
-      (let [retry? (try
-                     (let [{:keys [status body]} (book-class!
-                                                   config auth-headers booking-details
-                                                   :interceptors
-                                                   (filterv (comp not #{::interceptors/throw-on-exceptional-status-code} :name)
-                                                            interceptors/default-interceptors))]
-                       (cond
-                         (interceptors/unexceptional-statuses status) (println "Class booked successfully.")
-                         (= status 409) (do (Thread/sleep 10000) true) ;TODO check what response is actually given for trying to book too early. Make sure it's different from trying to book a full class.
-                         :else (println "Failed to book class." status body)))
+    (loop [sleep-times (list* 30 30 3 5 10 (repeat 15))]
+      (let [recur? (try
+                     (let [class-status (fetch-class-status config auth-headers class-id)]
+                       (case class-status
+                         ::ready (do (do-book-class! config auth-headers class-id club-id)
+                                     (println "Class booked successfully"))
+                         ::too-soon (do (println "Class not ready to be booked; waiting...")
+                                        (Thread/sleep ^long (* 1000 (next sleep-times)))
+                                        true)
+                         ::actioned (println "Booking has already been requested; no action required")
+                         (::full ::unavailable) (println "Class could not be booked as it is" (name class-status))))
                      (catch Exception e
                        (println "Error while attempting to book class"
                                 (ex-message e)
-                                (with-out-str (stacktrace/print-stack-trace e)))))]
-        (when retry?
-          (recur))))))
+                                (with-out-str (stacktrace/print-cause-trace e)))))]
+        (when recur?
+          (recur (rest sleep-times)))))))
 
 (def cli-spec
   {:spec {:schedule {:coerce   fs/file
-                     :desc     "Path to the config file for scheduling a future bookings."
+                     :desc     "Path to the config file for scheduling a future bookings"
                      :validate fs/exists?}
           :book     {:coerce   fs/file
-                     :desc     "Path to the config file for booking classes."
+                     :desc     "Path to the config file for booking a class"
                      :validate fs/exists?}}})
 
 (defn -main [args]
